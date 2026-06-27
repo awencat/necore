@@ -3,12 +3,14 @@ package service
 import (
 	"encoding/json"
 	"necore/dao"
+	"necore/model"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/golang-jwt/jwt/v5"
 )
 
 // Handlers
+
+const dummyPasswordHash = "$2a$12$KIX5gnQp2zfN8mjxJZ3v/eJQJjMKqQn2Cw4dHpRrv0vJ6X6WfR4he"
 
 func Login(c *fiber.Ctx) error {
 	// Parse Request Body
@@ -27,6 +29,8 @@ func Login(c *fiber.Ctx) error {
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal Server Error", "err": err})
 	} else if userModel == nil {
+		// Avoid timing attack
+		dao.CheckUserPassword(input.Password, dummyPasswordHash)
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Invalid identity or password", "err": err})
 	}
 
@@ -77,8 +81,8 @@ func Login(c *fiber.Ctx) error {
 // Register by admin
 func AddUser(c *fiber.Ctx) error {
 	// Check if user is admin
-	token := c.Locals("user").(*jwt.Token)
-	if !dao.IsUserInGroup(token, "admin") {
+	currentUser := c.Locals("currentUser").(model.User)
+	if !dao.ContainsGroup(currentUser.Group, "admin") {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Forbidden"})
 	}
 
@@ -93,7 +97,7 @@ func AddUser(c *fiber.Ctx) error {
 	}
 
 	if err := dao.AddUserByUsername(user.Username, user.Password); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	return c.JSON(fiber.Map{})

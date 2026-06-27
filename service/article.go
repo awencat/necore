@@ -2,21 +2,49 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"necore/dao"
 	"necore/model"
+	"necore/util"
+	"necore/ws"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
 
+func generateStoredFilename(original string) (string, error) {
+	safeName, err := util.SafeFilename(original)
+	if err != nil {
+		return "", err
+	}
+
+	extension := strings.ToLower(filepath.Ext(safeName))
+
+	allowedExtensions := map[string]bool{
+		".png":  true,
+		".jpg":  true,
+		".jpeg": true,
+		".webp": true,
+		".pdf":  true,
+		".txt":  true,
+	}
+
+	if !allowedExtensions[extension] {
+		return "", errors.New("unsupported file extension")
+	}
+
+	return uuid.NewString() + extension, nil
+}
+
 func checkNewsPermission(c *fiber.Ctx) bool {
 	// Check if user is admin or news_admin
-	token := c.Locals("user").(*jwt.Token)
-	isAdmin := dao.IsUserInGroup(token, "admin")
-	isNewsAdmin := dao.IsUserInGroup(token, "news_admin")
+	user := c.Locals("currentUser").(model.User)
+	isAdmin := dao.ContainsGroup(user.Group, "admin")
+	isNewsAdmin := dao.ContainsGroup(user.Group, "news_admin")
 	if isAdmin || isNewsAdmin {
 		return false
 	}
@@ -45,8 +73,8 @@ func UpdateArticle(c *fiber.Ctx) error {
 	if checkNewsPermission(c) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Forbidden"})
 	}
-	token := c.Locals("user").(*jwt.Token)
-	author := dao.GetUsernameFromToken(token)
+	user := c.Locals("currentUser").(model.User)
+	author := user.Username
 
 	id := c.Params("id")
 	// Parse
@@ -63,18 +91,20 @@ func UpdateArticle(c *fiber.Ctx) error {
 		Content string `json:"content"`
 	}
 	type Payload struct {
-		Entity   PayloadEntity    `json:"entity"`
-		Content  []PayloadContent `json:"content"`
-		Category string           `json:"category"`
+		Entity           PayloadEntity    `json:"entity"`
+		Content          []PayloadContent `json:"content"`
+		Category         string           `json:"category"`
+		DoesNotify       bool             `json:"doesNotify"`
+		NotifySessionIDs []string         `json:"notifySessionIds"`
 	}
 	payload := new(Payload)
 	if err := c.BodyParser(payload); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	newContent, err := json.Marshal(payload.Content)
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	newArticle := model.Article{
@@ -91,7 +121,20 @@ func UpdateArticle(c *fiber.Ctx) error {
 	}
 
 	if err := dao.UpdateArticle(newArticle); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	if payload.DoesNotify {
+		message := fiber.Map{
+			"event": "article_updated",
+			"data":  newArticle,
+		}
+
+		if len(payload.NotifySessionIDs) > 0 {
+			go ws.GlobalHub.BroadcastToSessions(message, payload.NotifySessionIDs)
+		} else {
+			go ws.GlobalHub.Broadcast(message)
+		}
 	}
 
 	return c.SendStatus(fiber.StatusOK)
@@ -102,7 +145,7 @@ func GetArticleById(c *fiber.Ctx) error {
 
 	article, err := dao.GetArticle(id)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
 	type PayloadEntity struct {
 		Pin     bool   `json:"pin"`
@@ -146,7 +189,7 @@ func GetArticleCountByCategory(c *fiber.Ctx) error {
 	// target: "information" | "magazine" | "notice" | "activity" | "document"
 	count, err := dao.GetArticleCountByCategory(category)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
 	return c.JSON(fiber.Map{"total": count})
 }
@@ -160,11 +203,11 @@ func GetArticleList(c *fiber.Ctx) error {
 	}
 	payload := new(Payload)
 	if err := c.BodyParser(payload); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 	articles, err := dao.GetArticleList(payload.Target, payload.Page, payload.PageSize, payload.Pin)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
 	type Entity struct {
 		Id      string `json:"id"`
@@ -198,15 +241,23 @@ func UploadArticleFile(c *fiber.Ctx) error {
 	id := c.Params("id")
 	file, err := c.FormFile("file")
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
-	if err := os.MkdirAll(fmt.Sprintf("./contents/%s", id), os.ModePerm); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
+	if err := os.MkdirAll(fmt.Sprintf("./contents/%s", id), 0o750); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
-	if err := c.SaveFile(file, fmt.Sprintf("./contents/%s/%s", id, file.Filename)); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
+	storedName, err := generateStoredFilename(file.Filename)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
-	return c.JSON(fiber.Map{"url": fmt.Sprintf("/contents/%s/%s", id, file.Filename)})
+	contentPath, err := util.SafeContentPath("./contents", id, storedName)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	if err := c.SaveFile(file, contentPath); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"url": fmt.Sprintf("/contents/%s/%s", id, storedName)})
 }
 
 func DeleteArticleFile(c *fiber.Ctx) error {
@@ -214,18 +265,35 @@ func DeleteArticleFile(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Forbidden"})
 	}
 
-	// id := c.Params("id") // It is included in the url
+	id := c.Params("id")
+
 	type Payload struct {
-		Url string `json:"url"`
+		Filename string `json:"filename"`
 	}
-	payload := new(Payload)
-	if err := c.BodyParser(payload); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err})
+
+	var payload Payload
+	if err := c.BodyParser(&payload); err != nil {
+		return c.Status(fiber.StatusBadRequest).
+			JSON(fiber.Map{"error": "Invalid request body"})
 	}
-	if err := os.Remove(fmt.Sprintf("./%s", payload.Url)); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
+
+	target, err := util.SafeContentPath("./contents", id, payload.Filename)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).
+			JSON(fiber.Map{"error": "Invalid filename"})
 	}
-	return c.SendStatus(fiber.StatusOK)
+
+	if err := os.Remove(target); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return c.Status(fiber.StatusNotFound).
+				JSON(fiber.Map{"error": "File not found"})
+		}
+
+		return c.Status(fiber.StatusInternalServerError).
+			JSON(fiber.Map{"error": "Internal server error"})
+	}
+
+	return c.SendStatus(fiber.StatusNoContent)
 }
 
 func DeleteArticle(c *fiber.Ctx) error {
@@ -235,7 +303,7 @@ func DeleteArticle(c *fiber.Ctx) error {
 
 	id := c.Params("id")
 	if err := dao.DeleteArticle(id); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
 	return c.SendStatus(fiber.StatusOK)
 }

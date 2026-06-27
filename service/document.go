@@ -2,21 +2,22 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"necore/dao"
 	"necore/model"
+	"necore/util"
 	"os"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
 
 func checkDocumentPermission(c *fiber.Ctx) bool {
 	// Check if user is admin or document_admin
-	token := c.Locals("user").(*jwt.Token)
-	isAdmin := dao.IsUserInGroup(token, "admin")
-	isDocsAdmin := dao.IsUserInGroup(token, "document_admin")
+	user := c.Locals("currentUser").(model.User)
+	isAdmin := dao.ContainsGroup(user.Group, "admin")
+	isDocsAdmin := dao.ContainsGroup(user.Group, "document_admin")
 	if isAdmin || isDocsAdmin {
 		return true
 	}
@@ -44,8 +45,8 @@ func CreateDocumentNode(c *fiber.Ctx) error {
 	}
 	uuid := uuid.New().String()
 
-	token := c.Locals("user").(*jwt.Token)
-	username := dao.GetUsernameFromToken(token)
+	user := c.Locals("currentUser").(model.User)
+	username := user.Username
 	if err := dao.CreateDocumentNode(r.ParentId, r.IsFolder, r.Private, r.Name, uuid, username); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": err.Error(),
@@ -106,8 +107,8 @@ func UpdateDocumentNodeContent(c *fiber.Ctx) error {
 	}
 	id := c.Params("id")
 
-	token := c.Locals("user").(*jwt.Token)
-	username := dao.GetUsernameFromToken(token)
+	user := c.Locals("currentUser").(model.User)
+	username := user.Username
 
 	type contentRequest struct {
 		Type    string `json:"type"`
@@ -303,31 +304,56 @@ func UploadDocumentFile(c *fiber.Ctx) error {
 			"error": err.Error(),
 		})
 	}
-	if err := os.MkdirAll(fmt.Sprintf("./contents/%s", id), os.ModePerm); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
+	if err := os.MkdirAll(fmt.Sprintf("./contents/%s", id), 0o750); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
-	if err := c.SaveFile(file, fmt.Sprintf("./contents/%s/%s", id, file.Filename)); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
+	storedName, err := generateStoredFilename(file.Filename)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
-	return c.JSON(fiber.Map{"url": fmt.Sprintf("/contents/%s/%s", id, file.Filename)})
+	contentPath, err := util.SafeContentPath("./contents", id, storedName)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	if err := c.SaveFile(file, contentPath); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"url": fmt.Sprintf("/contents/%s/%s", id, storedName)})
 }
 
 func DeleteDocumentFile(c *fiber.Ctx) error {
 	if !checkDocumentPermission(c) {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-			"error": "You don't have permission to update document node name",
-		})
+		return c.Status(fiber.StatusForbidden).
+			JSON(fiber.Map{"error": "Forbidden"})
 	}
-	// id := c.Params("id") // It is included in the url
+
+	id := c.Params("id")
+
 	type Payload struct {
-		Url string `json:"url"`
+		Filename string `json:"filename"`
 	}
-	payload := new(Payload)
-	if err := c.BodyParser(payload); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err})
+
+	var payload Payload
+	if err := c.BodyParser(&payload); err != nil {
+		return c.Status(fiber.StatusBadRequest).
+			JSON(fiber.Map{"error": "Invalid request body"})
 	}
-	if err := os.Remove(fmt.Sprintf("./%s", payload.Url)); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err})
+
+	target, err := util.SafeContentPath("./contents", id, payload.Filename)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).
+			JSON(fiber.Map{"error": "Invalid filename"})
 	}
-	return c.SendStatus(fiber.StatusOK)
+
+	if err := os.Remove(target); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return c.Status(fiber.StatusNotFound).
+				JSON(fiber.Map{"error": "File not found"})
+		}
+
+		return c.Status(fiber.StatusInternalServerError).
+			JSON(fiber.Map{"error": "Internal server error"})
+	}
+
+	return c.SendStatus(fiber.StatusNoContent)
 }
